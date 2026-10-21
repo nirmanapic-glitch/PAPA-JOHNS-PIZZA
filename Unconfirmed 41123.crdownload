@@ -1,0 +1,1060 @@
+/**
+ * Delivery Income Tracker — Papa Johns Rugby
+ * Pay calculation rules:
+ * - Base delivery pay: £1.20 / drop
+ * - Road Distance Bonus: £1.00 when miles >= 4.50
+ * - Hourly pay: Duration (hours) * £7.50
+ * - Total pay: Hourly Pay + Delivery Pay + Distance Bonuses
+ */
+
+(() => {
+  'use strict';
+
+  // --- DEFAULT SETTINGS ---
+  const DEFAULT_SETTINGS = {
+    deliveryRate: 1.20,
+    bonusRate: 1.00,
+    bonusThreshold: 4.50,
+    hourlyRate: 7.50,
+    pickupAddress: 'Papa Johns, 33 Clifton Rd, Rugby CV21 3PY, UK',
+    pickupCoords: { lat: 52.3734, lon: -1.2548 } // Rugby Papa Johns approximate coordinates
+  };
+
+  const STORAGE_KEYS = {
+    SETTINGS: 'pjr_delivery_settings',
+    SHIFTS: 'pjr_delivery_shifts',
+    DELIVERIES: 'pjr_delivery_records',
+    ACTIVE_SHIFT_ID: 'pjr_active_shift_id'
+  };
+
+  // --- STATE ---
+  let state = {
+    settings: loadSettings(),
+    shifts: loadShifts(),
+    deliveries: loadDeliveries(),
+    activeShiftId: localStorage.getItem(STORAGE_KEYS.ACTIVE_SHIFT_ID) || null
+  };
+
+  // --- DOM ELEMENTS ---
+  const el = {
+    tabs: document.querySelectorAll('.nav-item'),
+    tabPanels: document.querySelectorAll('.tab-panel'),
+    statusIndicator: document.getElementById('statusIndicator'),
+    
+    // Dashboard
+    dashTodayTotal: document.getElementById('dashTodayTotal'),
+    dashTodayHours: document.getElementById('dashTodayHours'),
+    dashTodayHourly: document.getElementById('dashTodayHourly'),
+    dashTodayHourlyRate: document.getElementById('dashTodayHourlyRate'),
+    dashTodayDrops: document.getElementById('dashTodayDrops'),
+    dashTodayDropCount: document.getElementById('dashTodayDropCount'),
+    dashTodayBonuses: document.getElementById('dashTodayBonuses'),
+    dashTodayBonusCount: document.getElementById('dashTodayBonusCount'),
+    dashTodayMiles: document.getElementById('dashTodayMiles'),
+    dashWeekTotal: document.getElementById('dashWeekTotal'),
+    dashWeekHours: document.getElementById('dashWeekHours'),
+    dashWeekDeliveries: document.getElementById('dashWeekDeliveries'),
+    dashWeekBonuses: document.getElementById('dashWeekBonuses'),
+    dashWeekMiles: document.getElementById('dashWeekMiles'),
+    btnStartShift: document.getElementById('btnStartShift'),
+    btnEndShift: document.getElementById('btnEndShift'),
+    shiftStatusDot: document.getElementById('shiftStatusDot'),
+    shiftStatusText: document.getElementById('shiftStatusText'),
+    activeShiftTimer: document.getElementById('activeShiftTimer'),
+
+    // Shift screen
+    shiftDateBadge: document.getElementById('shiftDateBadge'),
+    shiftTimeRangeDisplay: document.getElementById('shiftTimeRangeDisplay'),
+    shiftCurrentHours: document.getElementById('shiftCurrentHours'),
+    shiftCurrentDrops: document.getElementById('shiftCurrentDrops'),
+    shiftCurrentEarnings: document.getElementById('shiftCurrentEarnings'),
+    btnOpenAddDelivery: document.getElementById('btnOpenAddDelivery'),
+    btnEditShiftModal: document.getElementById('btnEditShiftModal'),
+    activeDeliveriesList: document.getElementById('activeDeliveriesList'),
+
+    // Modals
+    deliveryModal: document.getElementById('deliveryModal'),
+    deliveryForm: document.getElementById('deliveryForm'),
+    deliveryEditId: document.getElementById('deliveryEditId'),
+    deliveryPickup: document.getElementById('deliveryPickup'),
+    deliveryDestination: document.getElementById('deliveryDestination'),
+    btnCalculateRoute: document.getElementById('btnCalculateRoute'),
+    routeStatusMessage: document.getElementById('routeStatusMessage'),
+    deliveryMiles: document.getElementById('deliveryMiles'),
+    deliveryTime: document.getElementById('deliveryTime'),
+    deliveryNotes: document.getElementById('deliveryNotes'),
+    previewBasePay: document.getElementById('previewBasePay'),
+    previewBonusPay: document.getElementById('previewBonusPay'),
+    previewTotalPay: document.getElementById('previewTotalPay'),
+    btnCloseDeliveryModal: document.getElementById('btnCloseDeliveryModal'),
+    btnCancelDelivery: document.getElementById('btnCancelDelivery'),
+    
+    shiftModal: document.getElementById('shiftModal'),
+    shiftForm: document.getElementById('shiftForm'),
+    shiftEditId: document.getElementById('shiftEditId'),
+    shiftDate: document.getElementById('shiftDate'),
+    shiftStartTime: document.getElementById('shiftStartTime'),
+    shiftEndTime: document.getElementById('shiftEndTime'),
+    shiftOvernight: document.getElementById('shiftOvernight'),
+    previewShiftDuration: document.getElementById('previewShiftDuration'),
+    previewShiftHourly: document.getElementById('previewShiftHourly'),
+    btnCloseShiftModal: document.getElementById('btnCloseShiftModal'),
+    btnCancelShift: document.getElementById('btnCancelShift'),
+
+    // History
+    historyList: document.getElementById('historyList'),
+    historyDateFilter: document.getElementById('historyDateFilter'),
+    btnClearFilter: document.getElementById('btnClearFilter'),
+    btnExportJson: document.getElementById('btnExportJson'),
+    importJsonFile: document.getElementById('importJsonFile'),
+
+    // Settings
+    settingsForm: document.getElementById('settingsForm'),
+    settingDeliveryRate: document.getElementById('settingDeliveryRate'),
+    settingBonusRate: document.getElementById('settingBonusRate'),
+    settingBonusThreshold: document.getElementById('settingBonusThreshold'),
+    settingHourlyRate: document.getElementById('settingHourlyRate'),
+    settingPickupAddress: document.getElementById('settingPickupAddress'),
+    btnRunSelfTests: document.getElementById('btnRunSelfTests'),
+    selfTestResult: document.getElementById('selfTestResult')
+  };
+
+  // --- CORE CALCULATION ENGINE (STRICT & PURE) ---
+
+  /**
+   * Calculates duration in hours between start and end time strings (HH:mm)
+   * Supports overnight shifts (e.g., 17:00 to 01:00 = 8.00 hours)
+   */
+  function calculateShiftDurationHours(startTimeStr, endTimeStr, isOvernight) {
+    if (!startTimeStr || !endTimeStr) return 0;
+    const [startH, startM] = startTimeStr.split(':').map(Number);
+    const [endH, endM] = endTimeStr.split(':').map(Number);
+
+    let startTotalMins = startH * 60 + startM;
+    let endTotalMins = endH * 60 + endM;
+
+    // Overnight shift: end time has wrapped past midnight
+    if (isOvernight || endTotalMins < startTotalMins) {
+      endTotalMins += 24 * 60;
+    }
+
+    const diffMins = Math.max(0, endTotalMins - startTotalMins);
+    return Math.round((diffMins / 60) * 100) / 100;
+  }
+
+  /**
+   * Evaluates distance bonus for a specific road distance
+   * Must strictly be: miles >= threshold (e.g. 4.50) -> bonus, 4.49 -> 0
+   */
+  function evaluateDistanceBonus(miles, settings = state.settings) {
+    const numericMiles = Number(miles) || 0;
+    // Protect against floating point imprecision: 4.499999 is < 4.50
+    if (numericMiles >= settings.bonusThreshold) {
+      return {
+        qualifies: true,
+        bonusAmount: settings.bonusRate
+      };
+    }
+    return {
+      qualifies: false,
+      bonusAmount: 0.00
+    };
+  }
+
+  /**
+   * Calculate single delivery pay
+   */
+  function calculateDeliveryPay(miles, settings = state.settings) {
+    const base = settings.deliveryRate;
+    const bonus = evaluateDistanceBonus(miles, settings).bonusAmount;
+    return {
+      basePay: base,
+      bonusPay: bonus,
+      totalPay: Math.round((base + bonus) * 100) / 100
+    };
+  }
+
+  /**
+   * Calculate shift earnings summary with clean separation:
+   * Total = Hourly Pay + Delivery Pay + Distance Bonuses
+   */
+  function calculateShiftSummary(shift, shiftDeliveries, settings = state.settings) {
+    const durationHours = calculateShiftDurationHours(shift.startTime, shift.endTime, shift.isOvernight);
+    const hourlyPay = Math.round((durationHours * settings.hourlyRate) * 100) / 100;
+
+    let totalDeliveryBasePay = 0;
+    let totalBonusPay = 0;
+    let totalMiles = 0;
+    let bonusCount = 0;
+
+    shiftDeliveries.forEach(del => {
+      const miles = Number(del.miles) || 0;
+      totalMiles += miles;
+      totalDeliveryBasePay += settings.deliveryRate;
+      
+      const bonusCheck = evaluateDistanceBonus(miles, settings);
+      if (bonusCheck.qualifies) {
+        bonusCount += 1;
+        totalBonusPay += bonusCheck.bonusAmount;
+      }
+    });
+
+    totalMiles = Math.round(totalMiles * 100) / 100;
+    totalDeliveryBasePay = Math.round(totalDeliveryBasePay * 100) / 100;
+    totalBonusPay = Math.round(totalBonusPay * 100) / 100;
+
+    const totalEarnings = Math.round((hourlyPay + totalDeliveryBasePay + totalBonusPay) * 100) / 100;
+
+    return {
+      durationHours,
+      hourlyPay,
+      deliveryCount: shiftDeliveries.length,
+      totalDeliveryBasePay,
+      bonusCount,
+      totalBonusPay,
+      totalMiles,
+      totalEarnings
+    };
+  }
+
+  // --- STORAGE HELPERS ---
+  function loadSettings() {
+    try {
+      const data = localStorage.getItem(STORAGE_KEYS.SETTINGS);
+      return data ? { ...DEFAULT_SETTINGS, ...JSON.parse(data) } : { ...DEFAULT_SETTINGS };
+    } catch {
+      return { ...DEFAULT_SETTINGS };
+    }
+  }
+
+  function saveSettings(settings) {
+    state.settings = settings;
+    localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(settings));
+  }
+
+  function loadShifts() {
+    try {
+      return JSON.parse(localStorage.getItem(STORAGE_KEYS.SHIFTS)) || [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveShifts(shifts) {
+    state.shifts = shifts;
+    localStorage.setItem(STORAGE_KEYS.SHIFTS, JSON.stringify(shifts));
+  }
+
+  function loadDeliveries() {
+    try {
+      return JSON.parse(localStorage.getItem(STORAGE_KEYS.DELIVERIES)) || [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveDeliveries(deliveries) {
+    state.deliveries = deliveries;
+    localStorage.setItem(STORAGE_KEYS.DELIVERIES, JSON.stringify(deliveries));
+  }
+
+  // --- ROUTING & GEOCODING SERVICE (OSRM + NOMINATIM) ---
+
+  /**
+   * Geocodes an address or UK postcode using OpenStreetMap Nominatim
+   */
+  async function geocodeLocation(address) {
+    const cleanQuery = address.trim();
+    // Scope search specifically to UK if no country provided
+    const query = cleanQuery.toLowerCase().includes('uk') ? cleanQuery : `${cleanQuery}, Rugby, UK`;
+    const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(query)}`;
+
+    const response = await fetch(url, {
+      headers: {
+        'Accept': 'application/json'
+      }
+    });
+
+    if (!response.ok) throw new Error('Geocoding server error');
+    const data = await response.json();
+    if (!data || data.length === 0) throw new Error(`Address "${cleanQuery}" could not be found`);
+
+    return {
+      lat: parseFloat(data[0].lat),
+      lon: parseFloat(data[0].lon),
+      displayName: data[0].display_name
+    };
+  }
+
+  /**
+   * Calculates actual driving road distance (in miles) using OSRM routing engine
+   */
+  async function fetchDrivingDistanceMiles(startCoords, destCoords) {
+    const url = `https://router.project-osrm.org/route/v1/driving/${startCoords.lon},${startCoords.lat};${destCoords.lon},${destCoords.lat}?overview=false`;
+
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Routing server error');
+    const data = await response.json();
+
+    if (!data.routes || data.routes.length === 0) {
+      throw new Error('No driving route could be calculated');
+    }
+
+    const meters = data.routes[0].distance;
+    const roadMiles = meters * 0.000621371; // precise road miles
+    return Math.round(roadMiles * 100) / 100;
+  }
+
+  async function handleRouteCalculation() {
+    const pickupAddr = el.deliveryPickup.value.trim() || state.settings.pickupAddress;
+    const destAddr = el.deliveryDestination.value.trim();
+
+    if (!destAddr) {
+      alert('Please enter a destination postcode or address first.');
+      el.deliveryDestination.focus();
+      return;
+    }
+
+    el.btnCalculateRoute.disabled = true;
+    el.btnCalculateRoute.textContent = 'Calculating...';
+    el.routeStatusMessage.textContent = 'Looking up driving route...';
+    el.routeStatusMessage.style.color = 'var(--text-muted)';
+
+    try {
+      // 1. Geocode Pickup & Destination
+      let pickupCoords = state.settings.pickupCoords;
+      if (pickupAddr !== DEFAULT_SETTINGS.pickupAddress) {
+        pickupCoords = await geocodeLocation(pickupAddr);
+      }
+      const destCoords = await geocodeLocation(destAddr);
+
+      // 2. Query Driving Road Distance
+      const drivingMiles = await fetchDrivingDistanceMiles(pickupCoords, destCoords);
+
+      // 3. Populate field & update pay preview
+      el.deliveryMiles.value = drivingMiles.toFixed(2);
+      el.routeStatusMessage.textContent = `Actual road distance found: ${drivingMiles.toFixed(2)} miles`;
+      el.routeStatusMessage.style.color = '#065f46';
+      updateDeliveryPayPreview();
+
+    } catch (err) {
+      console.warn('Routing lookup failed:', err);
+      el.routeStatusMessage.textContent = `Route lookup failed: ${err.message}. Please enter the miles manually below.`;
+      el.routeStatusMessage.style.color = '#d90429';
+      el.deliveryMiles.focus();
+    } finally {
+      el.btnCalculateRoute.disabled = false;
+      el.btnCalculateRoute.textContent = 'Get Route';
+    }
+  }
+
+  function updateDeliveryPayPreview() {
+    const miles = parseFloat(el.deliveryMiles.value) || 0;
+    const pay = calculateDeliveryPay(miles, state.settings);
+    el.previewBasePay.textContent = `£${pay.basePay.toFixed(2)}`;
+    el.previewBonusPay.textContent = `£${pay.bonusPay.toFixed(2)}`;
+    el.previewTotalPay.textContent = `£${pay.totalPay.toFixed(2)}`;
+  }
+
+  // --- SHIFTS MANAGEMENT ---
+
+  function getActiveShift() {
+    if (!state.activeShiftId) return null;
+    return state.shifts.find(s => s.id === state.activeShiftId) || null;
+  }
+
+  function handleStartShift() {
+    const now = new Date();
+    const dateStr = now.toISOString().split('T')[0];
+    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+    const newShift = {
+      id: 'shift_' + Date.now(),
+      date: dateStr,
+      startTime: timeStr,
+      endTime: '',
+      isOvernight: false,
+      createdAt: Date.now()
+    };
+
+    state.shifts.unshift(newShift);
+    state.activeShiftId = newShift.id;
+    localStorage.setItem(STORAGE_KEYS.ACTIVE_SHIFT_ID, newShift.id);
+    saveShifts(state.shifts);
+
+    renderAll();
+    switchTab('tab-shift');
+  }
+
+  function handleEndShift() {
+    const active = getActiveShift();
+    if (!active) return;
+
+    const now = new Date();
+    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+    // Auto check if overnight
+    const [sH] = active.startTime.split(':').map(Number);
+    const [eH] = timeStr.split(':').map(Number);
+    const overnightLikely = eH < sH;
+
+    active.endTime = timeStr;
+    active.isOvernight = overnightLikely;
+
+    state.activeShiftId = null;
+    localStorage.removeItem(STORAGE_KEYS.ACTIVE_SHIFT_ID);
+    saveShifts(state.shifts);
+
+    renderAll();
+    alert(`Shift completed! Duration: ${calculateShiftDurationHours(active.startTime, active.endTime, active.isOvernight)} hrs.`);
+  }
+
+  function openEditShiftModal(shiftId) {
+    const shift = state.shifts.find(s => s.id === shiftId) || getActiveShift();
+    if (!shift) return;
+
+    el.shiftEditId.value = shift.id;
+    el.shiftDate.value = shift.date;
+    el.shiftStartTime.value = shift.startTime;
+    el.shiftEndTime.value = shift.endTime || '';
+    el.shiftOvernight.checked = Boolean(shift.isOvernight);
+
+    updateShiftModalPreview();
+    el.shiftModal.classList.remove('hidden');
+  }
+
+  function updateShiftModalPreview() {
+    const start = el.shiftStartTime.value;
+    const end = el.shiftEndTime.value;
+    const isOvernight = el.shiftOvernight.checked;
+    const hours = calculateShiftDurationHours(start, end, isOvernight);
+    const hourlyPay = hours * state.settings.hourlyRate;
+
+    el.previewShiftDuration.textContent = `${hours.toFixed(2)} hrs`;
+    el.previewShiftHourly.textContent = `£${hourlyPay.toFixed(2)}`;
+  }
+
+  function handleSaveShiftModal(e) {
+    e.preventDefault();
+    const shiftId = el.shiftEditId.value;
+    const shift = state.shifts.find(s => s.id === shiftId);
+    if (!shift) return;
+
+    shift.date = el.shiftDate.value;
+    shift.startTime = el.shiftStartTime.value;
+    shift.endTime = el.shiftEndTime.value;
+    shift.isOvernight = el.shiftOvernight.checked;
+
+    saveShifts(state.shifts);
+    el.shiftModal.classList.add('hidden');
+    renderAll();
+  }
+
+  function deleteShift(shiftId) {
+    if (!confirm('Are you sure you want to delete this entire shift and all its deliveries?')) return;
+
+    state.shifts = state.shifts.filter(s => s.id !== shiftId);
+    state.deliveries = state.deliveries.filter(d => d.shiftId !== shiftId);
+
+    if (state.activeShiftId === shiftId) {
+      state.activeShiftId = null;
+      localStorage.removeItem(STORAGE_KEYS.ACTIVE_SHIFT_ID);
+    }
+
+    saveShifts(state.shifts);
+    saveDeliveries(state.deliveries);
+    renderAll();
+  }
+
+  // --- DELIVERIES CRUD ---
+
+  function openAddDeliveryModal() {
+    const active = getActiveShift();
+    if (!active) {
+      alert('Please start a shift first before adding deliveries.');
+      return;
+    }
+
+    const now = new Date();
+    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+    el.deliveryForm.reset();
+    el.deliveryEditId.value = '';
+    el.deliveryShiftId.value = active.id;
+    el.deliveryPickup.value = state.settings.pickupAddress;
+    el.deliveryTime.value = timeStr;
+    el.routeStatusMessage.textContent = '';
+    el.deliveryModalTitle.textContent = 'Add Delivery Drop';
+
+    updateDeliveryPayPreview();
+    el.deliveryModal.classList.remove('hidden');
+    el.deliveryDestination.focus();
+  }
+
+  function openEditDeliveryModal(deliveryId) {
+    const del = state.deliveries.find(d => d.id === deliveryId);
+    if (!del) return;
+
+    el.deliveryEditId.value = del.id;
+    el.deliveryShiftId.value = del.shiftId;
+    el.deliveryPickup.value = del.pickupAddress;
+    el.deliveryDestination.value = del.destination;
+    el.deliveryMiles.value = del.miles;
+    el.deliveryTime.value = del.time;
+    el.deliveryNotes.value = del.notes || '';
+    el.routeStatusMessage.textContent = '';
+    el.deliveryModalTitle.textContent = 'Edit Delivery';
+
+    updateDeliveryPayPreview();
+    el.deliveryModal.classList.remove('hidden');
+  }
+
+  function handleSaveDelivery(e) {
+    e.preventDefault();
+
+    const editId = el.deliveryEditId.value;
+    const shiftId = el.deliveryShiftId.value || state.activeShiftId;
+    const pickupAddress = el.deliveryPickup.value.trim();
+    const destination = el.deliveryDestination.value.trim();
+    const miles = parseFloat(el.deliveryMiles.value);
+    const time = el.deliveryTime.value;
+    const notes = el.deliveryNotes.value.trim();
+
+    if (isNaN(miles) || miles < 0) {
+      alert('Please enter a valid road distance in miles.');
+      el.deliveryMiles.focus();
+      return;
+    }
+
+    // Anti-duplicate protection: check for same destination and same delivery time within current shift
+    const isDuplicate = state.deliveries.some(d =>
+      d.id !== editId &&
+      d.shiftId === shiftId &&
+      d.destination.toLowerCase() === destination.toLowerCase() &&
+      d.time === time
+    );
+
+    if (isDuplicate) {
+      if (!confirm('A delivery with this same destination and time was already recorded. Save anyway?')) {
+        return;
+      }
+    }
+
+    const pay = calculateDeliveryPay(miles, state.settings);
+
+    if (editId) {
+      // Update existing
+      const index = state.deliveries.findIndex(d => d.id === editId);
+      if (index !== -1) {
+        state.deliveries[index] = {
+          ...state.deliveries[index],
+          pickupAddress,
+          destination,
+          miles: Math.round(miles * 100) / 100,
+          time,
+          notes,
+          basePay: pay.basePay,
+          bonusPay: pay.bonusPay,
+          totalPay: pay.totalPay
+        };
+      }
+    } else {
+      // Create new
+      const newDel = {
+        id: 'del_' + Date.now(),
+        shiftId,
+        pickupAddress,
+        destination,
+        miles: Math.round(miles * 100) / 100,
+        time,
+        notes,
+        basePay: pay.basePay,
+        bonusPay: pay.bonusPay,
+        totalPay: pay.totalPay,
+        timestamp: Date.now()
+      };
+      state.deliveries.unshift(newDel);
+    }
+
+    saveDeliveries(state.deliveries);
+    el.deliveryModal.classList.add('hidden');
+    renderAll();
+  }
+
+  function deleteDelivery(deliveryId) {
+    if (!confirm('Delete this delivery?')) return;
+    state.deliveries = state.deliveries.filter(d => d.id !== deliveryId);
+    saveDeliveries(state.deliveries);
+    renderAll();
+  }
+
+  // --- RENDER FUNCTIONS ---
+
+  function renderDashboard() {
+    const todayStr = new Date().toISOString().split('T')[0];
+    const active = getActiveShift();
+
+    // 1. Shift Quick Action state
+    if (active) {
+      el.shiftStatusDot.classList.add('active');
+      el.shiftStatusText.textContent = `Shift Active (${active.startTime} – ongoing)`;
+      el.btnStartShift.classList.add('hidden');
+      el.btnEndShift.classList.remove('hidden');
+    } else {
+      el.shiftStatusDot.classList.remove('active');
+      el.shiftStatusText.textContent = 'No Active Shift';
+      el.btnStartShift.classList.remove('hidden');
+      el.btnEndShift.classList.add('hidden');
+    }
+
+    // 2. Today's Totals
+    const todayShifts = state.shifts.filter(s => s.date === todayStr);
+    let todayHours = 0;
+    let todayDeliveries = [];
+
+    todayShifts.forEach(shift => {
+      const endTime = shift.endTime || (active && active.id === shift.id ? getCurrentTimeString() : shift.startTime);
+      todayHours += calculateShiftDurationHours(shift.startTime, endTime, shift.isOvernight);
+      const shiftDels = state.deliveries.filter(d => d.shiftId === shift.id);
+      todayDeliveries = todayDeliveries.concat(shiftDels);
+    });
+
+    const todayHourlyPay = Math.round((todayHours * state.settings.hourlyRate) * 100) / 100;
+    const todayBasePay = Math.round((todayDeliveries.length * state.settings.deliveryRate) * 100) / 100;
+    
+    let todayBonusPay = 0;
+    let todayBonusCount = 0;
+    let todayMiles = 0;
+
+    todayDeliveries.forEach(del => {
+      todayMiles += Number(del.miles) || 0;
+      if (evaluateDistanceBonus(del.miles, state.settings).qualifies) {
+        todayBonusCount += 1;
+        todayBonusPay += state.settings.bonusRate;
+      }
+    });
+
+    const todayTotalEarnings = Math.round((todayHourlyPay + todayBasePay + todayBonusPay) * 100) / 100;
+
+    el.dashTodayTotal.textContent = `£${todayTotalEarnings.toFixed(2)}`;
+    el.dashTodayHours.textContent = `${todayHours.toFixed(2)} hrs • ${todayDeliveries.length} drop${todayDeliveries.length === 1 ? '' : 's'}`;
+    el.dashTodayHourly.textContent = `£${todayHourlyPay.toFixed(2)}`;
+    el.dashTodayHourlyRate.textContent = `£${state.settings.hourlyRate.toFixed(2)} / hr`;
+    el.dashTodayDrops.textContent = `£${todayBasePay.toFixed(2)}`;
+    el.dashTodayDropCount.textContent = `${todayDeliveries.length} @ £${state.settings.deliveryRate.toFixed(2)}`;
+    el.dashTodayBonuses.textContent = `£${todayBonusPay.toFixed(2)}`;
+    el.dashTodayBonusCount.textContent = `${todayBonusCount} (≥ ${state.settings.bonusThreshold.toFixed(2)} mi)`;
+    el.dashTodayMiles.textContent = `${todayMiles.toFixed(1)} mi`;
+
+    // 3. Weekly totals (Current week Monday - Sunday)
+    renderWeeklyStats();
+  }
+
+  function renderWeeklyStats() {
+    const now = new Date();
+    // UK week starts on Monday
+    const currentDay = now.getDay();
+    const distanceToMonday = (currentDay + 6) % 7;
+    const monday = new Date(now);
+    monday.setDate(now.getDate() - distanceToMonday);
+    monday.setHours(0, 0, 0, 0);
+
+    const weekShifts = state.shifts.filter(s => {
+      const shiftDate = new Date(s.date + 'T00:00:00');
+      return shiftDate >= monday;
+    });
+
+    let weekHours = 0;
+    let weekDeliveries = [];
+
+    weekShifts.forEach(shift => {
+      const endTime = shift.endTime || (state.activeShiftId === shift.id ? getCurrentTimeString() : shift.startTime);
+      weekHours += calculateShiftDurationHours(shift.startTime, endTime, shift.isOvernight);
+      const dels = state.deliveries.filter(d => d.shiftId === shift.id);
+      weekDeliveries = weekDeliveries.concat(dels);
+    });
+
+    const weekHourly = weekHours * state.settings.hourlyRate;
+    const weekBase = weekDeliveries.length * state.settings.deliveryRate;
+
+    let weekBonus = 0;
+    let weekBonusCount = 0;
+    let weekMiles = 0;
+
+    weekDeliveries.forEach(del => {
+      weekMiles += Number(del.miles) || 0;
+      if (evaluateDistanceBonus(del.miles, state.settings).qualifies) {
+        weekBonusCount += 1;
+        weekBonus += state.settings.bonusRate;
+      }
+    });
+
+    const weekTotal = weekHourly + weekBase + weekBonus;
+
+    el.dashWeekTotal.textContent = `£${weekTotal.toFixed(2)}`;
+    el.dashWeekHours.textContent = `${weekHours.toFixed(1)} hrs`;
+    el.dashWeekDeliveries.textContent = `${weekDeliveries.length} drops`;
+    el.dashWeekBonuses.textContent = `£${weekBonus.toFixed(2)} (${weekBonusCount})`;
+    el.dashWeekMiles.textContent = `${weekMiles.toFixed(1)} mi`;
+  }
+
+  function renderActiveShiftScreen() {
+    const active = getActiveShift();
+
+    if (!active) {
+      el.shiftDateBadge.textContent = 'Shift: None Active';
+      el.shiftTimeRangeDisplay.textContent = 'No Shift Running';
+      el.shiftCurrentHours.textContent = '0.00h';
+      el.shiftCurrentDrops.textContent = '0';
+      el.shiftCurrentEarnings.textContent = '£0.00';
+      el.btnEditShiftModal.classList.add('hidden');
+      el.btnOpenAddDelivery.disabled = true;
+      el.activeDeliveriesList.innerHTML = `
+        <div class="card text-center" style="color: var(--text-muted); padding: 30px 16px;">
+          <p>No active shift in progress.</p>
+          <button class="btn btn-primary" onclick="document.getElementById('btnStartShift').click()">Start a Shift</button>
+        </div>
+      `;
+      return;
+    }
+
+    el.btnOpenAddDelivery.disabled = false;
+    el.btnEditShiftModal.classList.remove('hidden');
+    el.shiftDateBadge.textContent = `Date: ${active.date}`;
+    el.shiftTimeRangeDisplay.textContent = `${active.startTime} → ${active.endTime || 'Working Now'}`;
+
+    const shiftDels = state.deliveries.filter(d => d.shiftId === active.id);
+    const summary = calculateShiftSummary(active, shiftDels, state.settings);
+
+    el.shiftCurrentHours.textContent = `${summary.durationHours.toFixed(2)}h`;
+    el.shiftCurrentDrops.textContent = summary.deliveryCount;
+    el.shiftCurrentEarnings.textContent = `£${summary.totalEarnings.toFixed(2)}`;
+
+    if (shiftDels.length === 0) {
+      el.activeDeliveriesList.innerHTML = `
+        <div class="card text-center" style="color: var(--text-muted); padding: 30px 16px;">
+          <p>No deliveries recorded for this shift yet.</p>
+          <small>Tap "+ Record Delivery" whenever you get a delivery dispatch.</small>
+        </div>
+      `;
+      return;
+    }
+
+    el.activeDeliveriesList.innerHTML = shiftDels.map((del, index) => {
+      const hasBonus = evaluateDistanceBonus(del.miles, state.settings).qualifies;
+      return `
+        <div class="delivery-card">
+          <div class="delivery-card-header">
+            <div>
+              <span style="font-size: 0.75rem; color: var(--text-muted);">#${shiftDels.length - index} • ${del.time}</span>
+              <div class="delivery-address">${escapeHtml(del.destination)}</div>
+            </div>
+            ${hasBonus ? `<span class="delivery-badge-bonus">+£1.00 Bonus (≥4.5mi)</span>` : ''}
+          </div>
+          
+          <div style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 4px;">
+            Road: <b>${del.miles.toFixed(2)} miles</b> ${del.notes ? `• <i>${escapeHtml(del.notes)}</i>` : ''}
+          </div>
+
+          <div class="delivery-details">
+            <div>
+              <span>Drop: £${state.settings.deliveryRate.toFixed(2)}</span>
+              ${hasBonus ? ` + <span>Bonus: £${state.settings.bonusRate.toFixed(2)}</span>` : ''}
+            </div>
+            <div class="delivery-price">£${(del.totalPay || (state.settings.deliveryRate + (hasBonus ? state.settings.bonusRate : 0))).toFixed(2)}</div>
+          </div>
+
+          <div class="delivery-actions-row">
+            <button class="btn btn-secondary btn-sm" onclick="window.DeliveryTracker.editDelivery('${del.id}')">Edit</button>
+            <button class="btn btn-danger btn-sm" onclick="window.DeliveryTracker.deleteDelivery('${del.id}')">Delete</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function renderHistory() {
+    const filterDate = el.historyDateFilter.value;
+    let filteredShifts = [...state.shifts];
+
+    if (filterDate) {
+      filteredShifts = filteredShifts.filter(s => s.date === filterDate);
+    }
+
+    if (filteredShifts.length === 0) {
+      el.historyList.innerHTML = `
+        <div class="card text-center" style="color: var(--text-muted); padding: 30px 16px;">
+          <p>No shift records found.</p>
+        </div>
+      `;
+      return;
+    }
+
+    el.historyList.innerHTML = filteredShifts.map(shift => {
+      const shiftDels = state.deliveries.filter(d => d.shiftId === shift.id);
+      const summary = calculateShiftSummary(shift, shiftDels, state.settings);
+
+      return `
+        <div class="card mb-3">
+          <div class="flex-between">
+            <h4 class="m-0" style="color: var(--primary);">${shift.date}</h4>
+            <span class="delivery-price">£${summary.totalEarnings.toFixed(2)}</span>
+          </div>
+
+          <div style="font-size: 0.85rem; color: var(--text-muted); margin-top: 4px;">
+            ${shift.startTime} – ${shift.endTime || 'Ongoing'} ${shift.isOvernight ? '<b>(Overnight)</b>' : ''}
+          </div>
+
+          <div class="shift-metrics-row mt-2">
+            <div>Duration: <b>${summary.durationHours.toFixed(2)}h</b> (£${summary.hourlyPay.toFixed(2)})</div>
+            <div>Drops: <b>${summary.deliveryCount}</b> (£${summary.totalDeliveryBasePay.toFixed(2)})</div>
+            <div>Bonuses: <b>${summary.bonusCount}</b> (£${summary.totalBonusPay.toFixed(2)})</div>
+          </div>
+
+          <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 6px;">
+            Total Miles: <b>${summary.totalMiles.toFixed(1)} mi</b>
+          </div>
+
+          <div class="delivery-actions-row border-top pt-1 mt-2">
+            <button class="btn btn-secondary btn-sm" onclick="window.DeliveryTracker.editShift('${shift.id}')">Edit Shift</button>
+            <button class="btn btn-danger btn-sm" onclick="window.DeliveryTracker.deleteShift('${shift.id}')">Delete Shift</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function renderSettings() {
+    el.settingDeliveryRate.value = state.settings.deliveryRate;
+    el.settingBonusRate.value = state.settings.bonusRate;
+    el.settingBonusThreshold.value = state.settings.bonusThreshold;
+    el.settingHourlyRate.value = state.settings.hourlyRate;
+    el.settingPickupAddress.value = state.settings.pickupAddress;
+  }
+
+  function renderAll() {
+    renderDashboard();
+    renderActiveShiftScreen();
+    renderHistory();
+  }
+
+  // --- TABS & NAVIGATION ---
+  function switchTab(tabId) {
+    el.tabPanels.forEach(panel => {
+      panel.classList.toggle('active', panel.id === tabId);
+    });
+    el.tabs.forEach(tab => {
+      tab.classList.toggle('active', tab.dataset.tab === tabId);
+    });
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  // --- EXPORT & IMPORT ---
+  function exportJson() {
+    const payload = {
+      exportDate: new Date().toISOString(),
+      version: '1.0',
+      settings: state.settings,
+      shifts: state.shifts,
+      deliveries: state.deliveries
+    };
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `PapaJohns_Deliveries_${new Date().toISOString().split('T')[0]}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function importJson(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const data = JSON.parse(event.target.result);
+        if (!data.shifts || !data.deliveries) {
+          throw new Error('Invalid format: missing shifts or deliveries array.');
+        }
+
+        if (confirm(`Import ${data.shifts.length} shifts and ${data.deliveries.length} deliveries? This will merge with your current records.`)) {
+          // Merge shifts by ID
+          const existingShiftIds = new Set(state.shifts.map(s => s.id));
+          data.shifts.forEach(s => {
+            if (!existingShiftIds.has(s.id)) state.shifts.push(s);
+          });
+
+          // Merge deliveries by ID
+          const existingDelIds = new Set(state.deliveries.map(d => d.id));
+          data.deliveries.forEach(d => {
+            if (!existingDelIds.has(d.id)) state.deliveries.push(d);
+          });
+
+          if (data.settings) {
+            state.settings = { ...state.settings, ...data.settings };
+            saveSettings(state.settings);
+          }
+
+          saveShifts(state.shifts);
+          saveDeliveries(state.deliveries);
+          renderAll();
+          alert('Import completed successfully!');
+        }
+      } catch (err) {
+        alert('Failed to parse file: ' + err.message);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  }
+
+  // --- AUTOMATED SELF-TESTS (PAY RULES VERIFICATION) ---
+  function runSelfTests() {
+    const results = [];
+    const testSettings = {
+      deliveryRate: 1.20,
+      bonusRate: 1.00,
+      bonusThreshold: 4.50,
+      hourlyRate: 7.50
+    };
+
+    // Test 1: 4.49 miles must NOT get bonus
+    const t1 = calculateDeliveryPay(4.49, testSettings);
+    const pass1 = t1.basePay === 1.20 && t1.bonusPay === 0 && t1.totalPay === 1.20;
+    results.push(`Test 1: 4.49 miles pay -> £${t1.totalPay.toFixed(2)} (Expected £1.20): ${pass1 ? 'PASS ✓' : 'FAIL ✗'}`);
+
+    // Test 2: 4.50 miles MUST get bonus
+    const t2 = calculateDeliveryPay(4.50, testSettings);
+    const pass2 = t2.basePay === 1.20 && t2.bonusPay === 1.00 && t2.totalPay === 2.20;
+    results.push(`Test 2: 4.50 miles pay -> £${t2.totalPay.toFixed(2)} (Expected £2.20): ${pass2 ? 'PASS ✓' : 'FAIL ✗'}`);
+
+    // Test 3: Overnight shift 18:00 to 02:00 = 8.00 hours
+    const hoursOvernight = calculateShiftDurationHours('18:00', '02:00', true);
+    const pass3 = hoursOvernight === 8.00;
+    results.push(`Test 3: Overnight 18:00 to 02:00 -> ${hoursOvernight} hrs (Expected 8.00): ${pass3 ? 'PASS ✓' : 'FAIL ✗'}`);
+
+    // Test 4: Combined shift total (4 hours @ £7.50 = £30.00 + two deliveries: one 3.0 mi (£1.20) + one 5.0 mi (£2.20) = £33.40)
+    const testShift = { startTime: '17:00', endTime: '21:00', isOvernight: false };
+    const testDels = [{ miles: 3.0 }, { miles: 5.0 }];
+    const summary = calculateShiftSummary(testShift, testDels, testSettings);
+    const pass4 = summary.totalEarnings === 33.40 && summary.bonusCount === 1 && summary.hourlyPay === 30.00;
+    results.push(`Test 4: Shift Totals -> £${summary.totalEarnings.toFixed(2)} (Expected £33.40): ${pass4 ? 'PASS ✓' : 'FAIL ✗'}`);
+
+    el.selfTestResult.classList.remove('hidden');
+    el.selfTestResult.textContent = results.join('\n');
+  }
+
+  // --- HELPERS ---
+  function getCurrentTimeString() {
+    const now = new Date();
+    return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  }
+
+  function escapeHtml(str) {
+    if (!str) return '';
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  function updateOnlineStatus() {
+    if (navigator.onLine) {
+      el.statusIndicator.textContent = 'Online';
+      el.statusIndicator.className = 'status-indicator online';
+    } else {
+      el.statusIndicator.textContent = 'Offline (Manual Miles)';
+      el.statusIndicator.className = 'status-indicator offline';
+    }
+  }
+
+  // --- EVENT LISTENERS ---
+  function initListeners() {
+    // Navigation
+    el.tabs.forEach(tab => {
+      tab.addEventListener('click', () => switchTab(tab.dataset.tab));
+    });
+
+    // Shifts
+    el.btnStartShift.addEventListener('click', handleStartShift);
+    el.btnEndShift.addEventListener('click', handleEndShift);
+    el.btnEditShiftModal.addEventListener('click', () => openEditShiftModal(state.activeShiftId));
+    el.btnCloseShiftModal.addEventListener('click', () => el.shiftModal.classList.add('hidden'));
+    el.btnCancelShift.addEventListener('click', () => el.shiftModal.classList.add('hidden'));
+    el.shiftForm.addEventListener('submit', handleSaveShiftModal);
+    el.shiftStartTime.addEventListener('input', updateShiftModalPreview);
+    el.shiftEndTime.addEventListener('input', updateShiftModalPreview);
+    el.shiftOvernight.addEventListener('change', updateShiftModalPreview);
+
+    // Deliveries
+    el.btnOpenAddDelivery.addEventListener('click', openAddDeliveryModal);
+    el.btnCloseDeliveryModal.addEventListener('click', () => el.deliveryModal.classList.add('hidden'));
+    el.btnCancelDelivery.addEventListener('click', () => el.deliveryModal.classList.add('hidden'));
+    el.deliveryForm.addEventListener('submit', handleSaveDelivery);
+    el.btnCalculateRoute.addEventListener('click', handleRouteCalculation);
+    el.deliveryMiles.addEventListener('input', updateDeliveryPayPreview);
+
+    // History & Export
+    el.historyDateFilter.addEventListener('change', renderHistory);
+    el.btnClearFilter.addEventListener('click', () => {
+      el.historyDateFilter.value = '';
+      renderHistory();
+    });
+    el.btnExportJson.addEventListener('click', exportJson);
+    el.importJsonFile.addEventListener('change', importJson);
+
+    // Settings
+    el.settingsForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      state.settings = {
+        deliveryRate: parseFloat(el.settingDeliveryRate.value) || 0,
+        bonusRate: parseFloat(el.settingBonusRate.value) || 0,
+        bonusThreshold: parseFloat(el.settingBonusThreshold.value) || 0,
+        hourlyRate: parseFloat(el.settingHourlyRate.value) || 0,
+        pickupAddress: el.settingPickupAddress.value.trim() || DEFAULT_SETTINGS.pickupAddress,
+        pickupCoords: DEFAULT_SETTINGS.pickupCoords
+      };
+      saveSettings(state.settings);
+      renderAll();
+      alert('Settings saved successfully!');
+    });
+
+    el.btnRunSelfTests.addEventListener('click', runSelfTests);
+
+    // Online / Offline monitor
+    window.addEventListener('online', updateOnlineStatus);
+    window.addEventListener('offline', updateOnlineStatus);
+  }
+
+  // Expose global methods for inline HTML event buttons
+  window.DeliveryTracker = {
+    editDelivery: openEditDeliveryModal,
+    deleteDelivery: deleteDelivery,
+    editShift: openEditShiftModal,
+    deleteShift: deleteShift
+  };
+
+  // --- SERVICE WORKER REGISTRATION ---
+  function registerServiceWorker() {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js')
+        .then(reg => console.log('PWA ServiceWorker registered with scope:', reg.scope))
+        .catch(err => console.warn('ServiceWorker registration skipped:', err));
+    }
+  }
+
+  // --- INITIALIZATION ---
+  function init() {
+    initListeners();
+    renderSettings();
+    renderAll();
+    updateOnlineStatus();
+    registerServiceWorker();
+  }
+
+  init();
+})();

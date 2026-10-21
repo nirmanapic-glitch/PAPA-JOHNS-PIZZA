@@ -1,0 +1,9 @@
+delivery-tracker/
+├── index.html        # App UI, iOS PWA meta tags, navigation & modals
+├── styles.css        # Mobile-first Dark Forest Green & white card UI
+├── app.js           # Core calculation engine, routing, storage, export/import
+├── manifest.json     # PWA configuration for Safari/Home Screen
+├── sw.js             # Service Worker for offline caching & instant launch
+└── icons/
+    ├── icon-192.png  # Web app icon
+    └── icon-512.png  # High-res iOS home screen icon
